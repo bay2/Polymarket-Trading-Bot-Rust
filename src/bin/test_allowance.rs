@@ -5,7 +5,6 @@ use polymarket_trading_bot::{PolymarketApi, Config};
 use std::str::FromStr;
 use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer as _;
-use polymarket_trading_bot::clob_sdk;
 
 #[derive(Parser, Debug)]
 #[command(name = "test_allowance")]
@@ -82,7 +81,7 @@ async fn main() -> Result<()> {
         } else if let Some(pk) = &config.polymarket.private_key {
             let signer = LocalSigner::from_str(pk)
                 .context("Failed to create signer from private key")?
-                .with_chain_id(Some(clob_sdk::polygon()));
+                .with_chain_id(Some(137u64));
             println!("   Wallet: {:#x} (EOA)", signer.address());
         } else {
             anyhow::bail!("Need either proxy_wallet_address or private_key to check approvals");

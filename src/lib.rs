@@ -1,5 +1,4 @@
 pub mod api;
-pub mod clob_sdk;
 pub mod backtest;
 pub mod detector;
 pub mod config;

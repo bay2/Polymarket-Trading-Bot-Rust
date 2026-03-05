@@ -9,13 +9,20 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use hex;
 use base64;
-use log::{warn, info, error};
+use log::warn;
 use std::sync::Arc;
 
-use crate::clob_sdk;
 use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer as _;
 use alloy::primitives::Address as AlloyAddress;
+
+use polymarket_client_sdk::POLYGON;
+use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
+use polymarket_client_sdk::auth::{Normal, Credentials, state::Authenticated, Uuid};
+use polymarket_client_sdk::clob::types::{Amount, AssetType, Side as ClobSide, SignatureType as ClobSignatureType};
+use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
+
+type AuthClobClient = ClobClient<Authenticated<Normal>>;
 
 // CTF (Conditional Token Framework) imports for redemption
 // Based on docs: https://docs.polymarket.com/developers/builders/relayer-client#redeem-positions
@@ -47,11 +54,6 @@ sol! {
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Polygon chain ID from clob_sdk (137).
-fn polygon() -> u64 {
-    clob_sdk::polygon()
-}
-
 pub struct PolymarketApi {
     client: Client,
     gamma_url: String,
@@ -65,8 +67,8 @@ pub struct PolymarketApi {
     signature_type: Option<u8>, // 0 = EOA, 1 = Proxy, 2 = GnosisSafe
     // Track if authentication was successful at startup
     authenticated: Arc<tokio::sync::Mutex<bool>>,
-    /// CLOB client handle from clob_sdk (created in authenticate(), used for orders/balance).
-    clob_client_handle: Arc<tokio::sync::Mutex<Option<u64>>>,
+    /// Authenticated CLOB client (created lazily in ensure_clob_client(), used for orders/balance).
+    clob_client: Arc<tokio::sync::Mutex<Option<AuthClobClient>>>,
 }
 
 impl PolymarketApi {
@@ -96,17 +98,25 @@ impl PolymarketApi {
             proxy_wallet_address,
             signature_type,
             authenticated: Arc::new(tokio::sync::Mutex::new(false)),
-            clob_client_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            clob_client: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
-    /// Ensure CLOB client is created and return handle. Call after authenticate() or when placing orders/checking balance.
-    fn ensure_clob_client(&self) -> Result<u64> {
-        let mut guard = self.clob_client_handle.try_lock()
-            .map_err(|_| anyhow::anyhow!("CLOB client handle lock contested"))?;
-        if let Some(h) = *guard {
-            return Ok(h);
+    /// Ensure CLOB client is created and return it. Call after authenticate() or when placing orders/checking balance.
+    async fn ensure_clob_client(&self) -> Result<AuthClobClient> {
+        // Fast path: return existing client clone
+        {
+            let guard = self.clob_client.lock().await;
+            if let Some(ref client) = *guard {
+                return Ok(client.clone());
+            }
         }
+        // Slow path: create a new authenticated client while holding the lock
+        let mut guard = self.clob_client.lock().await;
+        if let Some(ref client) = *guard {
+            return Ok(client.clone());
+        }
+
         let private_key = self.private_key.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Private key is required. Please set private_key in config.json"))?;
         let api_key = self.api_key.as_ref()
@@ -115,38 +125,66 @@ impl PolymarketApi {
             .ok_or_else(|| anyhow::anyhow!("API secret is required for CLOB client"))?;
         let api_passphrase = self.api_passphrase.as_ref()
             .ok_or_else(|| anyhow::anyhow!("API passphrase is required for CLOB client"))?;
+
         let sig_type = match (self.proxy_wallet_address.is_some(), self.signature_type) {
             (true, Some(0)) => anyhow::bail!("proxy_wallet_address is set but signature_type is 0 (EOA). Use 1 (POLY_PROXY) or 2 (GNOSIS_SAFE)."),
             (true, None) => {
                 eprintln!("⚠️  proxy_wallet_address set but signature_type not specified; defaulting to 1 (POLY_PROXY)");
-                1u8
+                ClobSignatureType::Proxy
             }
-            (true, Some(1)) | (true, Some(2)) => self.signature_type.unwrap(),
-            (false, Some(0)) | (false, None) => 0u8,
+            (true, Some(1)) => ClobSignatureType::Proxy,
+            (true, Some(2)) => ClobSignatureType::GnosisSafe,
+            (false, Some(0)) | (false, None) => ClobSignatureType::Eoa,
             (false, Some(1)) | (false, Some(2)) => anyhow::bail!("signature_type {} requires proxy_wallet_address", self.signature_type.unwrap()),
             (_, Some(n)) => anyhow::bail!("Invalid signature_type: {}. Must be 0, 1, or 2", n),
         };
-        let funder = self.proxy_wallet_address.as_deref();
-        let handle = clob_sdk::client_create(
-            &self.clob_url,
-            private_key,
-            polygon(),
-            funder,
-            sig_type,
-            api_key,
-            api_secret,
-            api_passphrase,
-        )?;
-        *guard = Some(handle);
-        Ok(handle)
+
+        let signer = alloy::signers::local::PrivateKeySigner::from_str(private_key.trim_start_matches("0x"))
+            .context("Invalid private key")?
+            .with_chain_id(Some(POLYGON));
+
+        let credentials = Credentials::new(
+            Uuid::parse_str(api_key).context("Invalid API key (must be UUID format)")?,
+            api_secret.clone(),
+            api_passphrase.clone(),
+        );
+
+        let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
+            .context("Failed to create CLOB client")?
+            .authentication_builder(&signer)
+            .credentials(credentials)
+            .signature_type(sig_type);
+
+        if let Some(ref proxy_addr) = self.proxy_wallet_address {
+            let addr = AlloyAddress::from_str(proxy_addr)
+                .context(format!("Invalid proxy_wallet_address: {}", proxy_addr))?;
+            auth_builder = auth_builder.funder(addr);
+        }
+
+        let client = auth_builder
+            .authenticate()
+            .await
+            .context("CLOB authentication failed")?;
+
+        *guard = Some(client.clone());
+        Ok(client)
     }
 
-    /// Authenticate with Polymarket CLOB API at startup (creates CLOB client via clob_sdk).
+    /// Create a PrivateKeySigner from the stored private key for order signing.
+    fn make_signer(&self) -> Result<alloy::signers::local::PrivateKeySigner> {
+        let pk = self.private_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Private key is required for signing orders"))?;
+        alloy::signers::local::PrivateKeySigner::from_str(pk.trim_start_matches("0x"))
+            .context("Invalid private key")
+            .map(|s| s.with_chain_id(Some(POLYGON)))
+    }
+
+    /// Authenticate with Polymarket CLOB API at startup (creates CLOB client via polymarket-client-sdk).
     /// Equivalent to JavaScript: new ClobClient(HOST, CHAIN_ID, signer, apiCreds, signatureType, funderAddress)
     pub async fn authenticate(&self) -> Result<()> {
-        let _ = self.ensure_clob_client()?;
+        let _ = self.ensure_clob_client().await?;
         *self.authenticated.lock().await = true;
-        eprintln!("✅ Successfully authenticated with Polymarket CLOB API (clob_sdk)");
+        eprintln!("✅ Successfully authenticated with Polymarket CLOB API");
         eprintln!("   ✓ Private key: Valid");
         eprintln!("   ✓ API credentials: Valid");
         if let Some(proxy_addr) = &self.proxy_wallet_address {
@@ -456,29 +494,45 @@ impl PolymarketApi {
         }
     }
 
-    /// Place an order using clob_sdk (post_limit_order).
+    /// Place a limit order using polymarket-client-sdk.
     /// Equivalent to JavaScript: client.createAndPostOrder(userOrder)
     pub async fn place_order(&self, order: &OrderRequest) -> Result<OrderResponse> {
         if order.side != "BUY" && order.side != "SELL" {
             anyhow::bail!("Invalid order side: {}. Must be 'BUY' or 'SELL'", order.side);
         }
-        let handle = self.ensure_clob_client()?;
+        let client = self.ensure_clob_client().await?;
+        let signer = self.make_signer()?;
+        let token_id = alloy::primitives::U256::from_str(&order.token_id)
+            .context("Invalid token_id")?;
+        let side = if order.side == "BUY" { ClobSide::Buy } else { ClobSide::Sell };
+        let price = rust_decimal::Decimal::from_str(&order.price).context("Invalid price")?;
+        let size = rust_decimal::Decimal::from_str(&order.size).context("Invalid size")?;
         eprintln!("📤 Creating and posting order: {} {} {} @ {}", order.side, order.size, order.token_id, order.price);
-        let order_id = clob_sdk::post_limit_order(handle, &order.token_id, &order.side, &order.price, &order.size)?;
-        eprintln!("✅ Order placed successfully! Order ID: {}", order_id);
+        let signable = client.limit_order()
+            .token_id(token_id)
+            .side(side)
+            .price(price)
+            .size(size)
+            .build()
+            .await
+            .context("Failed to build limit order")?;
+        let signed = client.sign(&signer, signable).await.context("Failed to sign limit order")?;
+        let result = client.post_order(signed).await.context("Failed to post limit order")?;
+        eprintln!("✅ Order placed successfully! Order ID: {}", result.order_id);
         Ok(OrderResponse {
-            order_id: Some(order_id.clone()),
+            order_id: Some(result.order_id.clone()),
             status: "LIVE".to_string(),
-            message: Some(format!("Order placed successfully. Order ID: {}", order_id)),
+            message: Some(format!("Order placed successfully. Order ID: {}", result.order_id)),
         })
     }
 
-    /// Place multiple limit orders (one post_limit_order per order via clob_sdk).
+    /// Place multiple limit orders (one per order via polymarket-client-sdk).
     pub async fn place_limit_orders(&self, orders: &[OrderRequest]) -> Result<Vec<OrderResponse>> {
         if orders.is_empty() {
             return Ok(Vec::new());
         }
-        let handle = self.ensure_clob_client()?;
+        let client = self.ensure_clob_client().await?;
+        let signer = self.make_signer()?;
         eprintln!("📤 Posting {} limit orders...", orders.len());
         let mut out = Vec::with_capacity(orders.len());
         for (i, order) in orders.iter().enumerate() {
@@ -490,11 +544,28 @@ impl PolymarketApi {
                 });
                 continue;
             }
-            match clob_sdk::post_limit_order(handle, &order.token_id, &order.side, &order.price, &order.size) {
-                Ok(order_id) => out.push(OrderResponse {
-                    order_id: Some(order_id.clone()),
+            let result = async {
+                let token_id = alloy::primitives::U256::from_str(&order.token_id)
+                    .context("Invalid token_id")?;
+                let side = if order.side == "BUY" { ClobSide::Buy } else { ClobSide::Sell };
+                let price = rust_decimal::Decimal::from_str(&order.price).context("Invalid price")?;
+                let size = rust_decimal::Decimal::from_str(&order.size).context("Invalid size")?;
+                let signable = client.limit_order()
+                    .token_id(token_id)
+                    .side(side)
+                    .price(price)
+                    .size(size)
+                    .build()
+                    .await
+                    .context("Failed to build limit order")?;
+                let signed = client.sign(&signer, signable).await.context("Failed to sign")?;
+                client.post_order(signed).await.context("Failed to post order")
+            }.await;
+            match result {
+                Ok(r) => out.push(OrderResponse {
+                    order_id: Some(r.order_id.clone()),
                     status: "LIVE".to_string(),
-                    message: Some(format!("Order ID: {}", order_id)),
+                    message: Some(format!("Order ID: {}", r.order_id)),
                 }),
                 Err(e) => {
                     let token_id = &order.token_id;
@@ -510,22 +581,11 @@ impl PolymarketApi {
         Ok(out)
     }
 
-    /// Cancel a specific order by order id (CLOB). Uses REST DELETE with HMAC auth (clob_sdk has no cancel).
+    /// Cancel a specific order by order id (CLOB) via polymarket-client-sdk.
     pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
-        let path = "/order";
-        let url = format!("{}{}", self.clob_url, path);
-        let body = serde_json::json!({ "orderID": order_id });
-        let body_str = body.to_string();
-        let mut request = self.client.delete(&url).json(&body);
-        request = self.add_auth_headers(request, "DELETE", path, &body_str)
-            .context("Failed to add auth headers for cancel")?;
+        let client = self.ensure_clob_client().await?;
         eprintln!("🛑 Cancelling order: {}", order_id);
-        let response = request.send().await.context("Failed to send cancel order request")?;
-        let status = response.status();
-        if !status.is_success() {
-            let err_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Cancel order failed (status {}): {}", status, err_text);
-        }
+        client.cancel_order(order_id).await.context("Failed to cancel order")?;
         eprintln!("✅ Order cancel confirmed for order: {}", order_id);
         Ok(())
     }
@@ -800,29 +860,53 @@ impl PolymarketApi {
         Ok(tokens_with_balance)
     }
 
-    /// Check USDC balance and allowance for buying tokens (via clob_sdk).
+    /// Check USDC balance and allowance for buying tokens.
     /// Returns (usdc_balance, usdc_allowance) as Decimal values.
     pub async fn check_usdc_balance_allowance(&self) -> Result<(rust_decimal::Decimal, rust_decimal::Decimal)> {
-        let handle = self.ensure_clob_client()?;
-        let (balance_str, allowance_str) = clob_sdk::balance_allowance(handle, "", "Collateral")?;
-        let balance = rust_decimal::Decimal::from_str(balance_str.trim()).unwrap_or(rust_decimal::Decimal::ZERO);
-        let allowance = rust_decimal::Decimal::from_str(allowance_str.trim()).unwrap_or(rust_decimal::Decimal::ZERO);
+        let client = self.ensure_clob_client().await?;
+        let req = BalanceAllowanceRequest::builder()
+            .asset_type(AssetType::Collateral)
+            .build();
+        let response = client.balance_allowance(req).await
+            .context("Failed to check USDC balance allowance")?;
+        let balance = response.balance;
+        let allowance = response.allowances.values()
+            .filter_map(|s| rust_decimal::Decimal::from_str(s).ok())
+            .max()
+            .unwrap_or(rust_decimal::Decimal::ZERO);
         Ok((balance, allowance))
     }
 
-    /// Check token balance only (for redemption/portfolio scanning) via clob_sdk.
+    /// Check token balance only (for redemption/portfolio scanning).
     pub async fn check_balance_only(&self, token_id: &str) -> Result<rust_decimal::Decimal> {
-        let handle = self.ensure_clob_client()?;
-        let (balance_str, _) = clob_sdk::balance_allowance(handle, token_id, "Conditional")?;
-        rust_decimal::Decimal::from_str(balance_str.trim()).context("Failed to parse balance")
+        let client = self.ensure_clob_client().await?;
+        let token_u256 = alloy::primitives::U256::from_str(token_id)
+            .context("Invalid token_id")?;
+        let req = BalanceAllowanceRequest::builder()
+            .asset_type(AssetType::Conditional)
+            .token_id(token_u256)
+            .build();
+        let response = client.balance_allowance(req).await
+            .context("Failed to check token balance")?;
+        Ok(response.balance)
     }
 
-    /// Check token balance and allowance before selling (via clob_sdk).
+    /// Check token balance and allowance before selling.
     pub async fn check_balance_allowance(&self, token_id: &str) -> Result<(rust_decimal::Decimal, rust_decimal::Decimal)> {
-        let handle = self.ensure_clob_client()?;
-        let (balance_str, allowance_str) = clob_sdk::balance_allowance(handle, token_id, "Conditional")?;
-        let balance = rust_decimal::Decimal::from_str(balance_str.trim()).context("Parse balance")?;
-        let allowance = rust_decimal::Decimal::from_str(allowance_str.trim()).unwrap_or(rust_decimal::Decimal::ZERO);
+        let client = self.ensure_clob_client().await?;
+        let token_u256 = alloy::primitives::U256::from_str(token_id)
+            .context("Invalid token_id")?;
+        let req = BalanceAllowanceRequest::builder()
+            .asset_type(AssetType::Conditional)
+            .token_id(token_u256)
+            .build();
+        let response = client.balance_allowance(req).await
+            .context("Failed to check token balance allowance")?;
+        let balance = response.balance;
+        let allowance = response.allowances.values()
+            .filter_map(|s| rust_decimal::Decimal::from_str(s).ok())
+            .max()
+            .unwrap_or(rust_decimal::Decimal::ZERO);
         let is_approved_for_all = match self.check_is_approved_for_all().await {
             Ok(true) => true,
             Ok(false) => {
@@ -838,33 +922,38 @@ impl PolymarketApi {
         Ok((balance, allowance))
     }
 
-    /// Refresh cached allowance for outcome token before selling (via clob_sdk).
+    /// Refresh cached allowance for outcome token before selling.
     pub async fn update_balance_allowance_for_sell(&self, token_id: &str) -> Result<()> {
-        let handle = self.ensure_clob_client()?;
-        clob_sdk::update_balance_allowance(handle, token_id, "Conditional")
+        let client = self.ensure_clob_client().await?;
+        let token_u256 = alloy::primitives::U256::from_str(token_id)
+            .context("Invalid token_id")?;
+        let req = BalanceAllowanceRequest::builder()
+            .asset_type(AssetType::Conditional)
+            .token_id(token_u256)
+            .build();
+        client.update_balance_allowance(req).await
+            .context("Failed to update balance allowance")?;
+        Ok(())
     }
 
-    /// Get the CLOB contract address for Polygon (from clob_sdk contract_config).
+    /// Get the CLOB contract address for Polygon.
     fn get_clob_contract_address(&self) -> Result<String> {
-        let config = clob_sdk::contract_config(polygon(), false)
-            .context("Failed to get contract config")?
-            .ok_or_else(|| anyhow::anyhow!("Contract config not available for chain"))?;
+        let config = polymarket_client_sdk::contract_config(POLYGON, false)
+            .ok_or_else(|| anyhow::anyhow!("Contract config not available for Polygon"))?;
         Ok(format!("{:#x}", config.exchange))
     }
 
-    /// Get the CTF contract address for Polygon (from clob_sdk contract_config).
+    /// Get the CTF contract address for Polygon.
     fn get_ctf_contract_address(&self) -> Result<String> {
-        let config = clob_sdk::contract_config(polygon(), false)
-            .context("Failed to get contract config")?
-            .ok_or_else(|| anyhow::anyhow!("Contract config not available for chain"))?;
+        let config = polymarket_client_sdk::contract_config(POLYGON, false)
+            .ok_or_else(|| anyhow::anyhow!("Contract config not available for Polygon"))?;
         Ok(format!("{:#x}", config.conditional_tokens))
     }
 
     /// Check if setApprovalForAll was already set for the Exchange contract
     pub async fn check_is_approved_for_all(&self) -> Result<bool> {
-        let config = clob_sdk::contract_config(polygon(), false)
-            .context("Failed to load contract config")?
-            .ok_or_else(|| anyhow::anyhow!("Contract config not available"))?;
+        let config = polymarket_client_sdk::contract_config(POLYGON, false)
+            .ok_or_else(|| anyhow::anyhow!("Contract config not available for Polygon"))?;
         let ctf_contract_address = config.conditional_tokens;
         let exchange_address = config.exchange;
         let account_to_check = if let Some(proxy_addr) = &self.proxy_wallet_address {
@@ -875,18 +964,18 @@ impl PolymarketApi {
                 .ok_or_else(|| anyhow::anyhow!("Private key required to check approval"))?;
             let signer = LocalSigner::from_str(private_key)
                 .context("Failed to create signer from private key")?
-                .with_chain_id(Some(polygon()));
+                .with_chain_id(Some(POLYGON));
             signer.address()
         };
-        
+
         const RPC_URL: &str = "https://polygon-rpc.com";
         let provider = ProviderBuilder::new()
             .connect(RPC_URL)
             .await
             .context("Failed to connect to Polygon RPC")?;
-        
+
         let ctf = IERC1155::new(ctf_contract_address, provider);
-        
+
         let approved = ctf
             .isApprovedForAll(account_to_check, exchange_address)
             .call()
@@ -902,12 +991,10 @@ impl PolymarketApi {
         const USDC_ADDRESS_STR: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
         let usdc_address = AlloyAddress::from_str(USDC_ADDRESS_STR)
             .context("Invalid USDC address")?;
-        let config = clob_sdk::contract_config(polygon(), false)
-            .context("Failed to load contract config")?
-            .ok_or_else(|| anyhow::anyhow!("Contract config not available"))?;
-        let neg_risk_config = clob_sdk::contract_config(polygon(), true)
-            .context("Failed to load neg risk config")?
-            .ok_or_else(|| anyhow::anyhow!("Neg risk contract config not available"))?;
+        let config = polymarket_client_sdk::contract_config(POLYGON, false)
+            .ok_or_else(|| anyhow::anyhow!("Contract config not available for Polygon"))?;
+        let neg_risk_config = polymarket_client_sdk::contract_config(POLYGON, true)
+            .ok_or_else(|| anyhow::anyhow!("Neg risk contract config not available for Polygon"))?;
         let account_to_check = if let Some(proxy_addr) = &self.proxy_wallet_address {
             AlloyAddress::parse_checksummed(proxy_addr, None)
                 .context(format!("Failed to parse proxy_wallet_address: {}", proxy_addr))?
@@ -916,7 +1003,7 @@ impl PolymarketApi {
                 .ok_or_else(|| anyhow::anyhow!("Private key required to check approval"))?;
             let signer = LocalSigner::from_str(private_key)
                 .context("Failed to create signer from private key")?
-                .with_chain_id(Some(polygon()));
+                .with_chain_id(Some(POLYGON));
             signer.address()
         };
         let provider = ProviderBuilder::new()
@@ -965,9 +1052,8 @@ impl PolymarketApi {
     /// - If using proxy_wallet_address: Uses relayer (gasless, no MATIC needed)
     /// - If NOT using proxy_wallet_address: The wallet derived from private_key needs MATIC
     pub async fn set_approval_for_all_clob(&self) -> Result<()> {
-        let config = clob_sdk::contract_config(polygon(), false)
-            .context("Failed to load contract config")?
-            .ok_or_else(|| anyhow::anyhow!("Contract config not available"))?;
+        let config = polymarket_client_sdk::contract_config(POLYGON, false)
+            .ok_or_else(|| anyhow::anyhow!("Contract config not available for Polygon"))?;
         let ctf_contract_address = config.conditional_tokens;
         let exchange_address = config.exchange;
         
@@ -995,7 +1081,7 @@ impl PolymarketApi {
             // Create signer from private key
             let signer = LocalSigner::from_str(private_key)
                 .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
-                .with_chain_id(Some(polygon()));
+                .with_chain_id(Some(POLYGON));
             
             let signer_address = signer.address();
             eprintln!("   💰 Wallet that needs MATIC for gas: {:#x}", signer_address);
@@ -1391,16 +1477,33 @@ impl PolymarketApi {
         } else if amount <= 0.0 {
             anyhow::bail!("Invalid shares amount: {}. Must be > 0.", amount);
         }
-        let handle = self.ensure_clob_client()?;
+        let client = self.ensure_clob_client().await?;
+        let signer = self.make_signer()?;
+        let token_u256 = alloy::primitives::U256::from_str(token_id).context("Invalid token_id")?;
+        let side_enum = if is_buy { ClobSide::Buy } else { ClobSide::Sell };
+        let amount_dec = rust_decimal::Decimal::from_str(&amount_str).context("Invalid amount")?;
+        let sdk_amount = if is_buy {
+            Amount::usdc(amount_dec).context("Invalid USDC amount")?
+        } else {
+            Amount::shares(amount_dec).context("Invalid shares amount")?
+        };
         let max_retries = if is_buy { 1 } else { 3 };
         for attempt in 1..=max_retries {
-            match clob_sdk::post_market_order(handle, token_id, side, &amount_str, is_buy, ot) {
-                Ok(order_id) => {
-                    eprintln!("   ✅ Posted | Order {}", order_id);
+            let signable = client.market_order()
+                .token_id(token_u256)
+                .side(side_enum)
+                .amount(sdk_amount)
+                .build()
+                .await
+                .context("Failed to build market order")?;
+            let signed = client.sign(&signer, signable).await.context("Failed to sign market order")?;
+            match client.post_order(signed).await {
+                Ok(result) => {
+                    eprintln!("   ✅ Posted | Order {}", result.order_id);
                     return Ok(OrderResponse {
-                        order_id: Some(order_id.clone()),
+                        order_id: Some(result.order_id.clone()),
                         status: "LIVE".to_string(),
-                        message: Some(format!("Market order executed. Order ID: {}", order_id)),
+                        message: Some(format!("Market order executed. Order ID: {}", result.order_id)),
                     });
                 }
                 Err(e) => {
@@ -1422,7 +1525,7 @@ impl PolymarketApi {
         unreachable!()
     }
 
-    /// Place multiple market orders (one post_market_order per order via clob_sdk).
+    /// Place multiple market orders (one per order via polymarket-client-sdk).
     pub async fn place_market_orders(
         &self,
         orders: &[(&str, f64, &str, Option<&str>)], // (token_id, amount, side, order_type)
@@ -1430,10 +1533,10 @@ impl PolymarketApi {
         if orders.is_empty() {
             return Ok(Vec::new());
         }
-        let handle = self.ensure_clob_client()?;
+        let client = self.ensure_clob_client().await?;
+        let signer = self.make_signer()?;
         let mut out = Vec::with_capacity(orders.len());
-        for (i, (token_id, amount, side, order_type)) in orders.iter().enumerate() {
-            let ot = order_type.unwrap_or("FOK");
+        for (i, (token_id, amount, side, _order_type)) in orders.iter().enumerate() {
             if *side != "BUY" && *side != "SELL" {
                 out.push(OrderResponse {
                     order_id: None,
@@ -1444,11 +1547,31 @@ impl PolymarketApi {
             }
             let amount_str = format!("{:.2}", amount);
             let is_buy = *side == "BUY";
-            match clob_sdk::post_market_order(handle, token_id, side, &amount_str, is_buy, ot) {
-                Ok(order_id) => out.push(OrderResponse {
-                    order_id: Some(order_id.clone()),
+            let result = async {
+                let token_u256 = alloy::primitives::U256::from_str(token_id)
+                    .context("Invalid token_id")?;
+                let side_enum = if is_buy { ClobSide::Buy } else { ClobSide::Sell };
+                let amount_dec = rust_decimal::Decimal::from_str(&amount_str).context("Invalid amount")?;
+                let sdk_amount = if is_buy {
+                    Amount::usdc(amount_dec).context("Invalid USDC amount")?
+                } else {
+                    Amount::shares(amount_dec).context("Invalid shares amount")?
+                };
+                let signable = client.market_order()
+                    .token_id(token_u256)
+                    .side(side_enum)
+                    .amount(sdk_amount)
+                    .build()
+                    .await
+                    .context("Failed to build market order")?;
+                let signed = client.sign(&signer, signable).await.context("Failed to sign")?;
+                client.post_order(signed).await.context("Failed to post order")
+            }.await;
+            match result {
+                Ok(r) => out.push(OrderResponse {
+                    order_id: Some(r.order_id.clone()),
                     status: "LIVE".to_string(),
-                    message: Some(format!("Order ID: {}", order_id)),
+                    message: Some(format!("Order ID: {}", r.order_id)),
                 }),
                 Err(e) => {
                     eprintln!("   Order {} (token {}...) rejected: {}", i + 1, &token_id[..token_id.len().min(16)], e);
@@ -1620,7 +1743,7 @@ impl PolymarketApi {
 
         let signer = LocalSigner::from_str(private_key)
             .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
-            .with_chain_id(Some(polygon()));
+            .with_chain_id(Some(POLYGON));
 
         let parse_address_hex = |s: &str| -> Result<AlloyAddress> {
             let hex_str = s.strip_prefix("0x").unwrap_or(s);
