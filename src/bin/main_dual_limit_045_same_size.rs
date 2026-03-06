@@ -1528,6 +1528,13 @@ async fn main() -> Result<()> {
                     } else {
                         (FOUR_MIN_HEDGE_MAX_PRICE, "4-min: ask < 0.65")
                     };
+                    // Ensure the trailing map is initialized for this market.
+                    {
+                        let mut min_map = two_min_trailing_min_ask.lock().await;
+                        if !min_map.contains_key(&price_key) {
+                            min_map.insert(price_key.clone(), current_ask);
+                        }
+                    }
                     let mut allow_buy_above_band = false;
                     if current_ask >= band_threshold {
                         let lowest_before = two_min_trailing_min_ask.lock().await.get(&price_key).copied().unwrap_or(current_ask);
@@ -1539,12 +1546,18 @@ async fn main() -> Result<()> {
                                 market_name, unfilled_type.display_name(), current_ask, band_threshold, band_label, lowest_before, bounce_threshold
                             );
                             // Fall through to trailing logic; do not update lowest_ask
-                        } else {
-                            two_min_trailing_min_ask.lock().await.insert(price_key.clone(), current_ask);
+                        } else if current_ask >= lowest_before + hedge_trailing_stop {
+                            // Trailing trigger: price bounced from lowest by >= trailing_stop.
+                            allow_buy_above_band = true;
                             crate::log_println!(
-                                "   Trailing [{}] unfilled {}: ask={:.4} >= {:.2} ({}) → update lowest_ask to {:.4}",
-                                market_name, unfilled_type.display_name(), current_ask, band_threshold, band_label, current_ask
+                                "   Trailing [{}] unfilled {}: ask={:.4} >= {:.2} ({}) lowest_ask={:.4} → trailing trigger (ask >= low+{:.3})",
+                                market_name, unfilled_type.display_name(), current_ask, band_threshold, band_label, lowest_before, hedge_trailing_stop
                             );
+                        } else {
+                            // Only update lowest when current ask is below previous lowest; never raise lowest.
+                            if current_ask < lowest_before {
+                                two_min_trailing_min_ask.lock().await.insert(price_key.clone(), current_ask);
+                            }
                             continue;
                         }
                     }
@@ -1742,6 +1755,11 @@ async fn main() -> Result<()> {
                             if hedge_shares < 0.001 {
                                 continue;
                             }
+                            // Skip if ask is at ceiling (>=0.99) — no valid market order can be built.
+                            if current_ask_4m >= 0.99 {
+                                crate::log_println!("   ⏭️ 4-MIN HEDGE: {} ask={:.4} at ceiling — skipping market buy", market_name, current_ask_4m);
+                                continue;
+                            }
                             let investment_over = hedge_shares * current_ask_4m;
                             crate::log_println!("🕐 4-MIN HEDGE (price > {:.2}): {} unfilled at ask ${:.4}, buying {:.6} shares at market", FOUR_MIN_HEDGE_BUY_OVER_PRICE, market_name, current_ask_4m, hedge_shares);
                             let opp = BuyOpportunity {
@@ -1819,6 +1837,11 @@ async fn main() -> Result<()> {
                             market_name, unfilled_type.display_name(), current_bid, trailing_stop_tolerance, current_ask_4m
                         );
                         if hedge_shares < 0.001 {
+                            continue;
+                        }
+                        // Skip if ask is at ceiling (>=0.99) — no valid market order can be built.
+                        if current_ask_4m >= 0.99 {
+                            crate::log_println!("   ⏭️ 4-MIN HEDGE (same-size): {} ask={:.4} at ceiling — skipping market buy", market_name, current_ask_4m);
                             continue;
                         }
                         crate::log_println!("🕐 4-MIN HEDGE (same-size): {} unfilled at ask ${:.4} (0.5 < bid < 0.65), buying {:.6} shares; will cancel limit only after buy succeeds", market_name, current_ask_4m, hedge_shares);

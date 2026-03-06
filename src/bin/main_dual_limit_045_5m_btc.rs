@@ -570,6 +570,14 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                // Skip if ask is at ceiling (>=0.99) — no valid market order can be built.
+                if first_ask >= 0.99 {
+                    crate::log_println!(
+                        "   ⏭️ Trailing-buy [5m BTC] first: {} ask={:.4} at ceiling — skipping market buy",
+                        first_type.display_name(), first_ask
+                    );
+                    return;
+                }
                 if !trader.is_simulation() {
                     crate::log_println!(
                         "   Trailing-buy [5m BTC] first: {} ask={:.4} <= high-{:.3} ({:.4}) → buying at market",
@@ -799,7 +807,8 @@ async fn main() -> Result<()> {
             }
             let run_4min = time_elapsed_seconds >= FOUR_MIN_AFTER_SECONDS;
             // From 4 min: if ask >= 0.85 buy at market now. If ask < 0.85 keep trailing (fall through) and buy when ask >= lowest_ask + trailing_stop.
-            if run_4min && current_ask >= hedge_price {
+            // Skip if ask is at ceiling (>=0.99) — no valid market order can be built and there's zero upside.
+            if run_4min && current_ask >= hedge_price && current_ask < 0.99 {
                 // Before buying: in live mode check real balance; skip if already have >= dual_limit_shares.
                 if !trader.is_simulation() {
                     if let Some(bal) = trader.get_token_balance_shares(&unfilled_token.token_id).await {
@@ -885,6 +894,14 @@ async fn main() -> Result<()> {
             } else {
                 (band_2min, "2-min", true)
             };
+                // Ensure the trailing map is always initialized: if no entry exists, insert current_ask
+                // so the trailing stop has a baseline even when ask starts above the band.
+                {
+                    let mut min_map = two_min_trailing_min_ask.lock().await;
+                    if !min_map.contains_key(&price_key) {
+                        min_map.insert(price_key.clone(), current_ask);
+                    }
+                }
             // Show trailing status on price line: lowest, trigger (lowest+0.03), band.
             {
                 let trailing_lowest = two_min_trailing_min_ask.lock().await.get(&price_key).copied().unwrap_or(current_ask);
@@ -893,7 +910,6 @@ async fn main() -> Result<()> {
                 *s = format!("trail: {} ask={:.2} low={:.2} trig={:.2} band={:.2}", unfilled_type.display_name(), current_ask, trailing_lowest, trigger, band_threshold);
             }
 
-                // When entering 3-min window, reset lowest_ask once (new baseline) unless we're allowing buy above band.
                 let mut allow_buy_above_band = false;
                 if current_ask >= band_threshold {
                     let lowest_before = two_min_trailing_min_ask.lock().await.get(&price_key).copied().unwrap_or(current_ask);
@@ -903,6 +919,14 @@ async fn main() -> Result<()> {
                         crate::log_println!(
                             "   Trailing [5m BTC] unfilled {}: ask={:.4} >= {:.2} ({}) but lowest_ask={:.4} <= {:.4} → allow buy (valid bounce)",
                             unfilled_type.display_name(), current_ask, band_threshold, band_label, lowest_before, bounce_threshold
+                        );
+                    } else if current_ask >= lowest_before + hedge_trailing_stop {
+                        // Trailing trigger: price bounced from lowest by >= trailing_stop, even though
+                        // lowest didn't drop below bounce_threshold. This is a valid trailing trigger.
+                        allow_buy_above_band = true;
+                        crate::log_println!(
+                            "   Trailing [5m BTC] unfilled {}: ask={:.4} >= {:.2} ({}) lowest_ask={:.4} → trailing trigger (ask >= low+{:.3})",
+                            unfilled_type.display_name(), current_ask, band_threshold, band_label, lowest_before, hedge_trailing_stop
                         );
                     } else {
                         // Only update lowest when current ask is below previous lowest; never raise lowest.
@@ -956,6 +980,15 @@ async fn main() -> Result<()> {
                             return;
                         }
                     }
+                }
+                // Skip if ask is at ceiling (>=0.99) — no valid market order can be built.
+                if current_ask >= 0.99 {
+                    crate::log_println!(
+                        "   ⏭️ Trailing [5m BTC] unfilled {}: ask={:.4} at ceiling — skipping market buy",
+                        unfilled_type.display_name(), current_ask
+                    );
+                    hedge_executed_for_market.lock().await.remove(&key);
+                    return;
                 }
                 crate::log_println!(
                     "   Trailing [5m BTC] unfilled {} ({}): TRIGGER ask={:.4} >= lowest_ask+{:.3} (lowest_ask={:.4}) → executing market buy",
