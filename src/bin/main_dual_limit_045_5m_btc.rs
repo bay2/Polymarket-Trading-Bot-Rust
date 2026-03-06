@@ -25,8 +25,12 @@ const NINETY_SEC_AFTER_SECONDS: u64 = 120;
 const THREE_MIN_AFTER_SECONDS: u64 = 180;
 /// 4-min: from here we commit to hedge: if ask >= hedge_price buy now; if ask < hedge_price keep trailing (bounce trigger).
 const FOUR_MIN_AFTER_SECONDS: u64 = 240;
-/// Only place limit orders when we're within this many seconds of period start (so we don't place mid-period when bot starts).
-const NEW_MARKET_PLACE_WINDOW_SECONDS: u64 = 15;
+/// Only place limit orders when we're within this many seconds of period start (real mode).
+/// 15s is tight enough to avoid placing stale mid-period orders if the bot restarts.
+const NEW_MARKET_PLACE_WINDOW_SECONDS_REAL: u64 = 15;
+/// In simulation mode use a larger window: Polymarket publishes the new market 0-30s after period
+/// start, and the discovery loop adds further latency, so 60s avoids missing the window.
+const NEW_MARKET_PLACE_WINDOW_SECONDS_SIM: u64 = 60;
 /// 2-min band = 1 - dual_limit_price - 0.1 (e.g. 0.45 when limit is 0.45). 3-min band = 1 - dual_limit_price (e.g. 0.55).
 const BAND_2MIN_OFFSET: f64 = 0.1;
 /// Trailing-buy mode: monitor the token whose ask is above this threshold (0.55).
@@ -113,12 +117,19 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let config = Config::load(&args.config)?;
+    let mut config = Config::load(&args.config)?;
+    // 5-minute markets close at period_timestamp + 300s; override the default 900s (15-min).
+    config.trading.market_duration_seconds = PERIOD_DURATION_5M;
 
     eprintln!("🚀 Starting Polymarket Dual Limit 5-Minute BTC Bot (2-min + 3-min trailing)");
     eprintln!("📝 Logs are being saved to: history.toml");
     let is_simulation = args.is_simulation();
     eprintln!("Mode: {}", if is_simulation { "SIMULATION" } else { "PRODUCTION" });
+    let new_market_place_window_seconds: u64 = if is_simulation {
+        NEW_MARKET_PLACE_WINDOW_SECONDS_SIM
+    } else {
+        NEW_MARKET_PLACE_WINDOW_SECONDS_REAL
+    };
     let limit_price = config.trading.dual_limit_price.unwrap_or(LIMIT_PRICE);
     let limit_shares = config.trading.dual_limit_shares;
     let hedge_price = config.trading.dual_limit_hedge_price.unwrap_or(DEFAULT_HEDGE_PRICE);
@@ -254,19 +265,42 @@ async fn main() -> Result<()> {
                 .as_secs();
             let current_period = (current_time / PERIOD_DURATION_5M) * PERIOD_DURATION_5M;
 
-            eprintln!("🔄 New 5-minute period detected! (Period: {}) Discovering BTC 5m market...", current_period);
+            eprintln!("🔄 New 5-minute period detected! (Period: {}) Polling for BTC 5m market...", current_period);
 
-            let mut seen_ids = std::collections::HashSet::new();
-            let (_, btc_id) = monitor_for_period_check.get_current_condition_ids().await;
-            seen_ids.insert(btc_id);
-
-            let btc_result = discover_btc_5m_market(&api_for_period_check, current_time, &mut seen_ids).await;
+            let (_, old_btc_id) = monitor_for_period_check.get_current_condition_ids().await;
             let eth_market = disabled_eth_market();
             let solana_market = disabled_solana_market();
             let xrp_market = disabled_xrp_market();
 
-            match btc_result {
-                Ok(btc_market) => {
+            // Poll for the new period market directly by slug.
+            // Polymarket publishes the new market 0-30s after period start; retry every 3s (up to 60s total).
+            // Only accept the exact new-period slug to avoid loading a stale previous-period market.
+            const MAX_DISCOVERY_ATTEMPTS: u32 = 20;
+            const DISCOVERY_RETRY_SECS: u64 = 3;
+            let new_slug = format!("btc-updown-5m-{}", current_period);
+            let mut found_market: Option<polymarket_trading_bot::models::Market> = None;
+            for attempt in 1..=MAX_DISCOVERY_ATTEMPTS {
+                match api_for_period_check.get_market_by_slug(&new_slug).await {
+                    Ok(market) if market.active && !market.closed && market.condition_id != old_btc_id => {
+                        eprintln!("✅ Found BTC 5m market '{}' on attempt {} (~{}s after period start)",
+                            new_slug, attempt, (attempt - 1) as u64 * DISCOVERY_RETRY_SECS);
+                        found_market = Some(market);
+                        break;
+                    }
+                    Ok(_) => {
+                        eprintln!("⏳ Market '{}' not yet live (attempt {}/{}), retrying in {}s...",
+                            new_slug, attempt, MAX_DISCOVERY_ATTEMPTS, DISCOVERY_RETRY_SECS);
+                    }
+                    Err(_) => {
+                        eprintln!("⏳ Market '{}' not yet available (attempt {}/{}), retrying in {}s...",
+                            new_slug, attempt, MAX_DISCOVERY_ATTEMPTS, DISCOVERY_RETRY_SECS);
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(DISCOVERY_RETRY_SECS)).await;
+            }
+
+            match found_market {
+                Some(btc_market) => {
                     if let Err(e) = monitor_for_period_check.update_markets(
                         eth_market.clone(),
                         btc_market.clone(),
@@ -287,7 +321,8 @@ async fn main() -> Result<()> {
                         trader_for_period_reset.reset_period(current_period).await;
                     }
                 }
-                Err(e) => warn!("Failed to discover BTC 5m market: {}", e),
+                None => warn!("Failed to discover BTC 5m market '{}' after {} attempts ({}s). Will retry next period.",
+                    new_slug, MAX_DISCOVERY_ATTEMPTS, MAX_DISCOVERY_ATTEMPTS as u64 * DISCOVERY_RETRY_SECS),
             }
         }
     });
@@ -315,7 +350,9 @@ async fn main() -> Result<()> {
         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let api_for_callback = api.clone();
 
-    monitor_arc.start_monitoring(move |snapshot| {
+    let trader_for_shutdown = trader_arc.clone();
+    let api_for_shutdown = api.clone();
+    let monitoring_fut = monitor_arc.start_monitoring(move |snapshot| {
         let trader = trader_clone.clone();
         let _api = api_for_callback.clone();
         let last_placed_period = last_placed_period.clone();
@@ -396,24 +433,26 @@ async fn main() -> Result<()> {
                         hedge_executed_for_market.lock().await.insert(key.clone());
                         two_min_trailing_min_ask.lock().await.remove(&price_key);
                         *trailing_status_line.lock().await = String::new();
-                        let investment = hedge_shares * opposite_ask;
-                        let opp = BuyOpportunity {
-                            condition_id: snapshot.btc_market.condition_id.clone(),
-                            token_id: opposite_token.token_id.clone(),
-                            token_type: opposite_type.clone(),
-                            bid_price: opposite_ask,
-                            period_timestamp: snapshot.period_timestamp,
-                            time_remaining_seconds: snapshot.time_remaining_seconds,
-                            time_elapsed_seconds,
-                            use_market_order: true,
-                            investment_amount_override: Some(investment),
-                            is_individual_hedge: true,
-                            is_standard_hedge: false,
-                            dual_limit_shares: Some(hedge_shares),
-                        };
-                        if let Err(e) = trader.execute_buy(&opp).await {
-                            warn!("Trailing-buy 4-min second token failed: {}", e);
-                            hedge_executed_for_market.lock().await.remove(&key);
+                        if !trader.is_simulation() {
+                            let investment = hedge_shares * opposite_ask;
+                            let opp = BuyOpportunity {
+                                condition_id: snapshot.btc_market.condition_id.clone(),
+                                token_id: opposite_token.token_id.clone(),
+                                token_type: opposite_type.clone(),
+                                bid_price: opposite_ask,
+                                period_timestamp: snapshot.period_timestamp,
+                                time_remaining_seconds: snapshot.time_remaining_seconds,
+                                time_elapsed_seconds,
+                                use_market_order: true,
+                                investment_amount_override: Some(investment),
+                                is_individual_hedge: true,
+                                is_standard_hedge: false,
+                                dual_limit_shares: Some(hedge_shares),
+                            };
+                            if let Err(e) = trader.execute_buy(&opp).await {
+                                warn!("Trailing-buy 4-min second token failed: {}", e);
+                                hedge_executed_for_market.lock().await.remove(&key);
+                            }
                         }
                         return;
                     }
@@ -468,24 +507,26 @@ async fn main() -> Result<()> {
                     hedge_executed_for_market.lock().await.insert(key.clone());
                     two_min_trailing_min_ask.lock().await.remove(&price_key);
                     *trailing_status_line.lock().await = String::new();
-                    let investment = hedge_shares * opposite_ask;
-                    let opp = BuyOpportunity {
-                        condition_id: snapshot.btc_market.condition_id.clone(),
-                        token_id: opposite_token.token_id.clone(),
-                        token_type: opposite_type,
-                        bid_price: opposite_ask,
-                        period_timestamp: snapshot.period_timestamp,
-                        time_remaining_seconds: snapshot.time_remaining_seconds,
-                        time_elapsed_seconds,
-                        use_market_order: true,
-                        investment_amount_override: Some(investment),
-                        is_individual_hedge: true,
-                        is_standard_hedge: false,
-                        dual_limit_shares: Some(hedge_shares),
-                    };
-                    if let Err(e) = trader.execute_buy(&opp).await {
-                        warn!("Trailing-buy second token failed: {}", e);
-                        hedge_executed_for_market.lock().await.remove(&key);
+                    if !trader.is_simulation() {
+                        let investment = hedge_shares * opposite_ask;
+                        let opp = BuyOpportunity {
+                            condition_id: snapshot.btc_market.condition_id.clone(),
+                            token_id: opposite_token.token_id.clone(),
+                            token_type: opposite_type,
+                            bid_price: opposite_ask,
+                            period_timestamp: snapshot.period_timestamp,
+                            time_remaining_seconds: snapshot.time_remaining_seconds,
+                            time_elapsed_seconds,
+                            use_market_order: true,
+                            investment_amount_override: Some(investment),
+                            is_individual_hedge: true,
+                            is_standard_hedge: false,
+                            dual_limit_shares: Some(hedge_shares),
+                        };
+                        if let Err(e) = trader.execute_buy(&opp).await {
+                            warn!("Trailing-buy second token failed: {}", e);
+                            hedge_executed_for_market.lock().await.remove(&key);
+                        }
                     }
                     return;
                 }
@@ -529,28 +570,30 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                crate::log_println!(
-                    "   Trailing-buy [5m BTC] first: {} ask={:.4} <= high-{:.3} ({:.4}) → buying at market",
-                    first_type.display_name(), first_ask, trailing_stop_point, highest - trailing_stop_point
-                );
-                let investment = first_shares * first_ask;
-                let opp = BuyOpportunity {
-                    condition_id: snapshot.btc_market.condition_id.clone(),
-                    token_id: first_token.token_id.clone(),
-                    token_type: first_type.clone(),
-                    bid_price: first_ask,
-                    period_timestamp: snapshot.period_timestamp,
-                    time_remaining_seconds: snapshot.time_remaining_seconds,
-                    time_elapsed_seconds,
-                    use_market_order: true,
-                    investment_amount_override: Some(investment),
-                    is_individual_hedge: true,
-                    is_standard_hedge: false,
-                    dual_limit_shares: Some(first_shares),
-                };
-                let buy_ok = trader.execute_buy(&opp).await.is_ok();
-                if buy_ok {
-                    trailing_buy_first_bought.lock().await.insert(key.clone(), (first_ask, monitor_up));
+                if !trader.is_simulation() {
+                    crate::log_println!(
+                        "   Trailing-buy [5m BTC] first: {} ask={:.4} <= high-{:.3} ({:.4}) → buying at market",
+                        first_type.display_name(), first_ask, trailing_stop_point, highest - trailing_stop_point
+                    );
+                    let investment = first_shares * first_ask;
+                    let opp = BuyOpportunity {
+                        condition_id: snapshot.btc_market.condition_id.clone(),
+                        token_id: first_token.token_id.clone(),
+                        token_type: first_type.clone(),
+                        bid_price: first_ask,
+                        period_timestamp: snapshot.period_timestamp,
+                        time_remaining_seconds: snapshot.time_remaining_seconds,
+                        time_elapsed_seconds,
+                        use_market_order: true,
+                        investment_amount_override: Some(investment),
+                        is_individual_hedge: true,
+                        is_standard_hedge: false,
+                        dual_limit_shares: Some(first_shares),
+                    };
+                    let buy_ok = trader.execute_buy(&opp).await.is_ok();
+                    if buy_ok {
+                        trailing_buy_first_bought.lock().await.insert(key.clone(), (first_ask, monitor_up));
+                    }
                 }
                 return;
             }
@@ -560,7 +603,7 @@ async fn main() -> Result<()> {
             {
                 let mut last = last_placed_period.lock().await;
                 let already_placed = last.map(|p| p == snapshot.period_timestamp).unwrap_or(false);
-                let in_new_market_window = snapshot.time_remaining_seconds >= PERIOD_DURATION_5M.saturating_sub(NEW_MARKET_PLACE_WINDOW_SECONDS);
+                let in_new_market_window = snapshot.time_remaining_seconds >= PERIOD_DURATION_5M.saturating_sub(new_market_place_window_seconds);
                 if !already_placed && in_new_market_window {
                     *last = Some(snapshot.period_timestamp);
                     if let Some(btc_up) = snapshot.btc_market.up_token.as_ref() {
@@ -773,48 +816,50 @@ async fn main() -> Result<()> {
                 hedge_executed_for_market.lock().await.insert(key.clone());
                 two_min_trailing_min_ask.lock().await.remove(&price_key);
                 *trailing_status_line.lock().await = String::new();
-                let investment = hedge_shares * current_ask;
-                crate::log_println!("🕐 4-MIN HEDGE (5m BTC): {} unfilled; ask={:.4} >= {:.2}; buying at market ${:.4}, {:.6} shares. Limit-filled side bought at ${:.4}",
-                    unfilled_type.display_name(), current_ask, hedge_price, current_ask, hedge_shares, filled_side_price);
-                let opp = BuyOpportunity {
-                    condition_id: snapshot.btc_market.condition_id.clone(),
-                    token_id: unfilled_token.token_id.clone(),
-                    token_type: unfilled_type,
-                    bid_price: current_ask,
-                    period_timestamp: snapshot.period_timestamp,
-                    time_remaining_seconds: snapshot.time_remaining_seconds,
-                    time_elapsed_seconds,
-                    use_market_order: true,
-                    investment_amount_override: Some(investment),
-                    is_individual_hedge: true,
-                    is_standard_hedge: false,
-                    dual_limit_shares: None,
-                };
-                let mut buy_ok = false;
-                for attempt in 1..=3 {
-                    match trader.execute_buy(&opp).await {
-                        Ok(()) => { buy_ok = true; break; }
-                        Err(e) => {
-                            warn!("4-min hedge (5m): market buy failed (attempt {}/3): {}", attempt, e);
-                            if attempt < 3 {
-                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                if !trader.is_simulation() {
+                    let investment = hedge_shares * current_ask;
+                    crate::log_println!("🕐 4-MIN HEDGE (5m BTC): {} unfilled; ask={:.4} >= {:.2}; buying at market ${:.4}, {:.6} shares. Limit-filled side bought at ${:.4}",
+                        unfilled_type.display_name(), current_ask, hedge_price, current_ask, hedge_shares, filled_side_price);
+                    let opp = BuyOpportunity {
+                        condition_id: snapshot.btc_market.condition_id.clone(),
+                        token_id: unfilled_token.token_id.clone(),
+                        token_type: unfilled_type,
+                        bid_price: current_ask,
+                        period_timestamp: snapshot.period_timestamp,
+                        time_remaining_seconds: snapshot.time_remaining_seconds,
+                        time_elapsed_seconds,
+                        use_market_order: true,
+                        investment_amount_override: Some(investment),
+                        is_individual_hedge: true,
+                        is_standard_hedge: false,
+                        dual_limit_shares: None,
+                    };
+                    let mut buy_ok = false;
+                    for attempt in 1..=3 {
+                        match trader.execute_buy(&opp).await {
+                            Ok(()) => { buy_ok = true; break; }
+                            Err(e) => {
+                                warn!("4-min hedge (5m): market buy failed (attempt {}/3): {}", attempt, e);
+                                if attempt < 3 {
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                }
                             }
                         }
                     }
-                }
-                if !buy_ok {
-                    warn!("4-min hedge (5m): market buy failed after 3 attempts");
-                    hedge_executed_for_market.lock().await.remove(&key);
-                    return;
-                }
-                trader.mark_limit_trade_filled_by_hedge(snapshot.period_timestamp, &unfilled_token.token_id).await;
-                for attempt in 1..=3 {
-                    if let Ok(()) = trader.cancel_pending_limit_buy(snapshot.period_timestamp, &unfilled_token.token_id).await {
-                        crate::log_println!("   🗑️ Cancelled unfilled $0.45 limit order (4-min hedge)");
-                        break;
+                    if !buy_ok {
+                        warn!("4-min hedge (5m): market buy failed after 3 attempts");
+                        hedge_executed_for_market.lock().await.remove(&key);
+                        return;
                     }
-                    if attempt < 3 {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    trader.mark_limit_trade_filled_by_hedge(snapshot.period_timestamp, &unfilled_token.token_id).await;
+                    for attempt in 1..=3 {
+                        if let Ok(()) = trader.cancel_pending_limit_buy(snapshot.period_timestamp, &unfilled_token.token_id).await {
+                            crate::log_println!("   🗑️ Cancelled unfilled $0.45 limit order (4-min hedge)");
+                            break;
+                        }
+                        if attempt < 3 {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        }
                     }
                 }
                 return;
@@ -929,64 +974,84 @@ async fn main() -> Result<()> {
                 if is_2min_window {
                     two_min_hedge_markets.lock().await.insert(key.clone());
                 }
-                let opp = BuyOpportunity {
-                    condition_id: snapshot.btc_market.condition_id.clone(),
-                    token_id: unfilled_token.token_id.clone(),
-                    token_type: unfilled_type,
-                    bid_price: current_ask,
-                    period_timestamp: snapshot.period_timestamp,
-                    time_remaining_seconds: snapshot.time_remaining_seconds,
-                    time_elapsed_seconds,
-                    use_market_order: true,
-                    investment_amount_override: Some(investment),
-                    is_individual_hedge: true,
-                    is_standard_hedge: false,
-                    dual_limit_shares: None,
-                };
-                let mut buy_ok = false;
-                for attempt in 1..=3 {
-                    match trader.execute_buy(&opp).await {
-                        Ok(()) => { buy_ok = true; break; }
-                        Err(e) => {
-                            warn!("{} (5m): market buy failed (attempt {}/3): {}", if is_2min_window { "2-min hedge" } else if run_4min { "4-min hedge" } else { "3-min hedge" }, attempt, e);
-                            if attempt < 3 {
-                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                if !trader.is_simulation() {
+                    let opp = BuyOpportunity {
+                        condition_id: snapshot.btc_market.condition_id.clone(),
+                        token_id: unfilled_token.token_id.clone(),
+                        token_type: unfilled_type,
+                        bid_price: current_ask,
+                        period_timestamp: snapshot.period_timestamp,
+                        time_remaining_seconds: snapshot.time_remaining_seconds,
+                        time_elapsed_seconds,
+                        use_market_order: true,
+                        investment_amount_override: Some(investment),
+                        is_individual_hedge: true,
+                        is_standard_hedge: false,
+                        dual_limit_shares: None,
+                    };
+                    let mut buy_ok = false;
+                    for attempt in 1..=3 {
+                        match trader.execute_buy(&opp).await {
+                            Ok(()) => { buy_ok = true; break; }
+                            Err(e) => {
+                                warn!("{} (5m): market buy failed (attempt {}/3): {}", if is_2min_window { "2-min hedge" } else if run_4min { "4-min hedge" } else { "3-min hedge" }, attempt, e);
+                                if attempt < 3 {
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                }
                             }
                         }
                     }
-                }
-                if !buy_ok {
-                    warn!("{} (5m): market buy failed after 3 attempts - leaving limit in place", if is_2min_window { "2-min hedge" } else if run_4min { "4-min hedge" } else { "3-min hedge" });
-                    // Remove key so a later tick can retry (we already inserted above to block re-entry during attempts).
-                    hedge_executed_for_market.lock().await.remove(&key);
-                    if is_2min_window {
-                        two_min_hedge_markets.lock().await.remove(&key);
-                    }
-                    return;
-                }
-                trader.mark_limit_trade_filled_by_hedge(snapshot.period_timestamp, &unfilled_token.token_id).await;
-                let mut cancel_ok = false;
-                for attempt in 1..=3 {
-                    match trader.cancel_pending_limit_buy(snapshot.period_timestamp, &unfilled_token.token_id).await {
-                        Ok(()) => {
-                            crate::log_println!("   🗑️ Cancelled unfilled $0.45 limit order ({} hedge)", if is_2min_window { "2-min" } else if run_4min { "4-min" } else { "3-min" });
-                            cancel_ok = true;
-                            break;
+                    if !buy_ok {
+                        warn!("{} (5m): market buy failed after 3 attempts - leaving limit in place", if is_2min_window { "2-min hedge" } else if run_4min { "4-min hedge" } else { "3-min hedge" });
+                        // Remove key so a later tick can retry (we already inserted above to block re-entry during attempts).
+                        hedge_executed_for_market.lock().await.remove(&key);
+                        if is_2min_window {
+                            two_min_hedge_markets.lock().await.remove(&key);
                         }
-                        Err(e) => {
-                            warn!("{} (5m): cancel failed (attempt {}/3): {}", if is_2min_window { "2-min hedge" } else if run_4min { "4-min hedge" } else { "3-min hedge" }, attempt, e);
-                            if attempt < 3 {
-                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        return;
+                    }
+                    trader.mark_limit_trade_filled_by_hedge(snapshot.period_timestamp, &unfilled_token.token_id).await;
+                    let mut cancel_ok = false;
+                    for attempt in 1..=3 {
+                        match trader.cancel_pending_limit_buy(snapshot.period_timestamp, &unfilled_token.token_id).await {
+                            Ok(()) => {
+                                crate::log_println!("   🗑️ Cancelled unfilled $0.45 limit order ({} hedge)", if is_2min_window { "2-min" } else if run_4min { "4-min" } else { "3-min" });
+                                cancel_ok = true;
+                                break;
+                            }
+                            Err(e) => {
+                                warn!("{} (5m): cancel failed (attempt {}/3): {}", if is_2min_window { "2-min hedge" } else if run_4min { "4-min hedge" } else { "3-min hedge" }, attempt, e);
+                                if attempt < 3 {
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                }
                             }
                         }
                     }
-                }
-                if !cancel_ok {
-                    warn!("{} (5m): could not cancel limit after 3 attempts - you may have double position", if is_2min_window { "2-min hedge" } else if run_4min { "4-min hedge" } else { "3-min hedge" });
+                    if !cancel_ok {
+                        warn!("{} (5m): could not cancel limit after 3 attempts - you may have double position", if is_2min_window { "2-min hedge" } else if run_4min { "4-min hedge" } else { "3-min hedge" });
+                    }
                 }
                 // hedge_executed_for_market and trailing state already set before execute_buy to stop re-entry.
         }
-    }).await;
+    });
+
+    tokio::select! {
+        _ = monitoring_fut => {}
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("
+⚠️  Shutting down (Ctrl+C)...");
+            if is_simulation {
+                if let Some(tracker) = trader_for_shutdown.get_simulation_tracker() {
+                    eprintln!("🔍 Querying Polymarket for market outcomes...");
+                    tracker.settle_open_positions(api_for_shutdown.as_ref()).await;
+                    match tracker.write_final_report_json("simulation_report.json").await {
+                        Ok(()) => eprintln!("✅ Final simulation report saved to simulation_report.json"),
+                        Err(e) => eprintln!("❌ Failed to write simulation report: {}", e),
+                    }
+                }
+            }
+        }
+    }
 
     Ok(())
 }

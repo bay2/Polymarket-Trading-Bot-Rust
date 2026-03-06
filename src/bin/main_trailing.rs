@@ -339,7 +339,8 @@ async fn main() -> Result<()> {
         }
     });
 
-    monitor_arc
+    let trader_for_shutdown = trader.clone();
+    let monitoring_fut = monitor_arc
         .start_monitoring(move |snapshot| {
             let trader = trader.clone();
             let state = state.clone();
@@ -815,8 +816,23 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-        })
-        .await;
+        });
+
+    tokio::select! {
+        _ = monitoring_fut => {}
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("
+⚠️  Shutting down (Ctrl+C)...");
+            if is_simulation {
+                if let Some(tracker) = trader_for_shutdown.get_simulation_tracker() {
+                    match tracker.write_final_report_json("simulation_report.json").await {
+                        Ok(()) => eprintln!("✅ Final simulation report saved to simulation_report.json"),
+                        Err(e) => eprintln!("❌ Failed to write simulation report: {}", e),
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 

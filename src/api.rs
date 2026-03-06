@@ -517,7 +517,10 @@ impl PolymarketApi {
             .await
             .context("Failed to build limit order")?;
         let signed = client.sign(&signer, signable).await.context("Failed to sign limit order")?;
-        let result = client.post_order(signed).await.context("Failed to post limit order")?;
+        let result = client.post_order(signed).await.map_err(|e| {
+            eprintln!("   🔍 Raw post_order error: {:?}", e);
+            e
+        }).context("Failed to post limit order")?;
         eprintln!("✅ Order placed successfully! Order ID: {}", result.order_id);
         Ok(OrderResponse {
             order_id: Some(result.order_id.clone()),
@@ -559,7 +562,10 @@ impl PolymarketApi {
                     .await
                     .context("Failed to build limit order")?;
                 let signed = client.sign(&signer, signable).await.context("Failed to sign")?;
-                client.post_order(signed).await.context("Failed to post order")
+                client.post_order(signed).await.map_err(|e| {
+                    eprintln!("   🔍 Raw post_order error (batch): {:?}", e);
+                    e
+                }).context("Failed to post order")
             }.await;
             match result {
                 Ok(r) => out.push(OrderResponse {
@@ -1121,153 +1127,218 @@ impl PolymarketApi {
     /// Set approval for all tokens via Polymarket relayer (for proxy wallets)
     /// Based on: https://docs.polymarket.com/developers/builders/relayer-client
     /// 
-    /// NOTE: For signature_type 2 (GNOSIS_SAFE), the relayer expects a complex Safe transaction format
-    /// with nonce, Safe address derivation, struct hash signing, etc. This implementation uses a
-    /// simpler format that may work for signature_type 1 (POLY_PROXY). If you get 400/401 errors
-    /// with signature_type 2, the full Safe transaction flow needs to be implemented.
+    /// Execute transactions via the Polymarket relayer for proxy wallets (gasless).
+    /// Follows the builder-relayer-client TypeScript SDK protocol:
+    /// 1. GET /relay-payload to get nonce + relay address
+    /// 2. Encode calls via ProxyWalletFactory.proxy(calls)
+    /// 3. Create struct hash and sign with private key
+    /// 4. POST /submit with signed proxy transaction request
     async fn set_approval_for_all_via_relayer(
         &self,
         ctf_contract_address: AlloyAddress,
         exchange_address: AlloyAddress,
     ) -> Result<()> {
-        // Check signature_type - warn if using GNOSIS_SAFE (type 2) as it may need different format
-        if let Some(2) = self.signature_type {
-            eprintln!("   ⚠️  Using signature_type 2 (GNOSIS_SAFE) - relayer may require Safe transaction format");
-            eprintln!("   💡 If this fails, the full Safe transaction flow (nonce, Safe address, struct hash) may be needed");
-        }
-        
-        // Function signature: setApprovalForAll(address operator, bool approved)
-        // Function selector: keccak256("setApprovalForAll(address,bool)")[0:4] = 0xa22cb465
-        let function_selector = hex::decode("a22cb465")
-            .context("Failed to decode function selector")?;
-        
-        // Encode parameters: (address operator, bool approved)
-        let mut encoded_params = Vec::new();
-        
-        // Encode operator address (20 bytes, left-padded to 32 bytes)
+        let private_key = self.private_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Private key required for relayer signing"))?;
+        let signer = LocalSigner::from_str(private_key.trim_start_matches("0x"))
+            .context("Failed to create signer from private key")?
+            .with_chain_id(Some(POLYGON));
+        let from_address = signer.address();
+        let from_str = format!("{:#x}", from_address);
+
+        // Proxy contract config for Polygon
+        const PROXY_FACTORY: &str = "0xaB45c5A4B0c941a2F231C04C3f49182e1A254052";
+        const RELAY_HUB: &str = "0xD216153c06E857cD7f72665E0aF1d7D82172F494";
+        const PROXY_INIT_CODE_HASH: &str = "0xd21df8dc65880a8606f09fe0ce3df9b8869287ab0b058be05aa9e8af6330a00b";
+
+        // Derive proxy wallet address via CREATE2
+        let proxy_factory_addr = AlloyAddress::from_str(PROXY_FACTORY).unwrap();
+        // Salt = keccak256(encodePacked(["address"], [from]))  — matches TypeScript SDK deriveProxyWallet
+        // encodePacked for address = just the raw 20 bytes
+        let salt = keccak256(from_address.as_slice());
+        let init_code_hash = B256::from_str(PROXY_INIT_CODE_HASH).unwrap();
+        let proxy_wallet = proxy_factory_addr.create2(salt, init_code_hash);
+        let proxy_wallet_str = format!("{:#x}", proxy_wallet);
+        eprintln!("   Derived proxy wallet: {}", proxy_wallet_str);
+
+        // Build setApprovalForAll(address,bool) call data
+        let mut call_data = hex::decode("a22cb465").unwrap();
         let mut operator_bytes = [0u8; 32];
         operator_bytes[12..].copy_from_slice(exchange_address.as_slice());
-        encoded_params.extend_from_slice(&operator_bytes);
-        
-        // Encode approved (bool) - true = 1, padded to 32 bytes
-        let approved_bytes = U256::from(1u64).to_be_bytes::<32>();
-        encoded_params.extend_from_slice(&approved_bytes);
-        
-        // Combine function selector with encoded parameters
-        let mut call_data = function_selector;
-        call_data.extend_from_slice(&encoded_params);
-        
+        call_data.extend_from_slice(&operator_bytes);
+        call_data.extend_from_slice(&U256::from(1u64).to_be_bytes::<32>());
         let call_data_hex = format!("0x{}", hex::encode(&call_data));
-        
-        eprintln!("   📝 Encoded call data: {}", call_data_hex);
-        
-        // Use relayer for gasless transaction. The /execute path returns 404; the
-        // builder-relayer-client uses POST /submit. See: Polymarket/builder-relayer-client
-        const RELAYER_SUBMIT: &str = "https://relayer-v2.polymarket.com/submit";
-        
-        eprintln!("   📤 Sending setApprovalForAll transaction via relayer (POST /submit)...");
-        
-        // Build transaction for relayer (matches SafeTransaction: to, operation=Call, data, value)
-        let ctf_address_str = format!("{:#x}", ctf_contract_address);
-        let transaction = serde_json::json!({
-            "to": ctf_address_str,
-            "operation": 0u8,   // 0 = Call
-            "data": call_data_hex,
-            "value": "0"
-        });
-        
+        eprintln!("   📝 setApprovalForAll call data: {}", call_data_hex);
+
+        // Step 1: Get relay payload (nonce + relay address)
+        let relay_payload_url = format!(
+            "https://relayer-v2.polymarket.com/relay-payload?address={}&type=PROXY",
+            from_str
+        );
+        eprintln!("   📡 Getting relay payload...");
+        let rp_response = self.client.get(&relay_payload_url)
+            .header("User-Agent", "polymarket-trading-bot/1.0")
+            .send().await.context("Failed to get relay payload")?;
+        if !rp_response.status().is_success() {
+            let status = rp_response.status();
+            let text = rp_response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to get relay payload ({}): {}", status, text);
+        }
+        let rp_data: serde_json::Value = rp_response.json().await
+            .context("Failed to parse relay payload")?;
+        let relay_address = rp_data["address"].as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing relay address in payload: {:?}", rp_data))?;
+        let nonce = rp_data["nonce"].as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing nonce in payload: {:?}", rp_data))?;
+        eprintln!("   Relay address: {}, Nonce: {}", relay_address, nonce);
+
+        // Step 2: Encode proxy transaction data via ProxyWalletFactory.proxy(calls)
+        // Use alloy sol! types for correct ABI encoding
+        use alloy::sol_types::SolCall;
+        sol! {
+            struct ProxyCall {
+                uint8 typeCode;
+                address to;
+                uint256 value;
+                bytes data;
+            }
+            function proxy(ProxyCall[] calls) external payable returns (bytes[]);
+        }
+
+        let proxy_call = proxyCall {
+            calls: vec![
+                ProxyCall {
+                    typeCode: 0, // Call
+                    to: ctf_contract_address,
+                    value: U256::ZERO,
+                    data: call_data.clone().into(),
+                },
+            ],
+        };
+        let proxy_call_data = proxy_call.abi_encode();
+        let proxy_call_data_hex = format!("0x{}", hex::encode(&proxy_call_data));
+        eprintln!("   📝 proxy() call data: {}...{}", &proxy_call_data_hex[..10], &proxy_call_data_hex[proxy_call_data_hex.len()-8..]);
+
+        // Step 3: Create struct hash and sign
+        // Gas limit must be small enough that RelayHub has enough gasleft() to forward.
+        // The relayer sends ~550K total gas to RelayHub; we need gasLimit < (550K - overhead).
+        // A simple setApprovalForAll call uses ~50K gas.
+        let gas_limit = "100000".to_string();
+        eprintln!("   Gas limit: {}", gas_limit);
+        let gas_price = "0";
+        let relayer_fee = "0";
+
+        let mut struct_data = Vec::new();
+        // "rlx:" prefix
+        struct_data.extend_from_slice(b"rlx:");
+        // from address (20 bytes, as hex without prefix)
+        struct_data.extend_from_slice(&hex::decode(&from_str[2..]).unwrap());
+        // to = ProxyFactory address (20 bytes)
+        struct_data.extend_from_slice(&hex::decode(&PROXY_FACTORY[2..]).unwrap());
+        // data (raw bytes)
+        struct_data.extend_from_slice(&proxy_call_data);
+        // txFee as uint256
+        struct_data.extend_from_slice(&U256::from_str(relayer_fee).unwrap().to_be_bytes::<32>());
+        // gasPrice as uint256
+        struct_data.extend_from_slice(&U256::from_str(gas_price).unwrap().to_be_bytes::<32>());
+        // gasLimit as uint256
+        struct_data.extend_from_slice(&U256::from_str(&gas_limit).unwrap().to_be_bytes::<32>());
+        // nonce as uint256
+        struct_data.extend_from_slice(&U256::from_str(nonce).unwrap().to_be_bytes::<32>());
+        // relayHub address (20 bytes)
+        struct_data.extend_from_slice(&hex::decode(&RELAY_HUB[2..]).unwrap());
+        // relay address (20 bytes)
+        let relay_addr_clean = relay_address.trim_start_matches("0x");
+        struct_data.extend_from_slice(&hex::decode(relay_addr_clean).unwrap());
+
+        let struct_hash = keccak256(&struct_data);
+        eprintln!("   📝 Struct hash: 0x{}", hex::encode(struct_hash));
+
+        // Sign the struct hash as a message (personal_sign / EIP-191 style)
+        let sig = signer.sign_message(struct_hash.as_slice()).await
+            .context("Failed to sign struct hash")?;
+        let signature_hex = format!("0x{}", hex::encode(sig.as_bytes()));
+        eprintln!("   ✅ Signed proxy transaction");
+
+        // Step 4: Build and submit the request
         let relayer_request = serde_json::json!({
-            "transactions": [transaction],
-            "description": format!("Set approval for all tokens - approve Exchange contract {:#x}", exchange_address)
+            "from": from_str,
+            "to": PROXY_FACTORY,
+            "proxyWallet": proxy_wallet_str,
+            "data": proxy_call_data_hex,
+            "nonce": nonce,
+            "signature": signature_hex,
+            "signatureParams": {
+                "gasPrice": gas_price,
+                "gasLimit": gas_limit,
+                "relayerFee": relayer_fee,
+                "relayHub": RELAY_HUB,
+                "relay": relay_address
+            },
+            "type": "PROXY",
+            "metadata": format!("setApprovalForAll: approve Exchange {:#x} on CTF {:#x}", exchange_address, ctf_contract_address)
         });
-        
-        // Add authentication headers (Builder API credentials)
+
         let api_key = self.api_key.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("API key required for relayer. Please set api_key in config.json"))?;
+            .ok_or_else(|| anyhow::anyhow!("API key required for relayer"))?;
         let api_secret = self.api_secret.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("API secret required for relayer. Please set api_secret in config.json"))?;
+            .ok_or_else(|| anyhow::anyhow!("API secret required for relayer"))?;
         let api_passphrase = self.api_passphrase.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("API passphrase required for relayer. Please set api_passphrase in config.json"))?;
-        
+            .ok_or_else(|| anyhow::anyhow!("API passphrase required for relayer"))?;
+
+        let body_string = serde_json::to_string(&relayer_request)
+            .context("Failed to serialize relayer request")?;
+
         let timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
         let timestamp_str = timestamp_ms.to_string();
-        
-        let body_string = serde_json::to_string(&relayer_request)
-            .context("Failed to serialize relayer request")?;
-        
-        let signature = Self::builder_relayer_signature(
-            api_secret,
-            timestamp_ms,
-            "POST",
-            "/submit",
-            &body_string,
+
+        let hmac_signature = Self::builder_relayer_signature(
+            api_secret, timestamp_ms, "POST", "/submit", &body_string,
         )?;
-        
-        // Send request to relayer
+
+        eprintln!("   📤 Submitting signed proxy transaction to relayer...");
+        const RELAYER_SUBMIT: &str = "https://relayer-v2.polymarket.com/submit";
+
         let response = self.client
             .post(RELAYER_SUBMIT)
             .header("User-Agent", "polymarket-trading-bot/1.0")
             .header("POLY_BUILDER_API_KEY", api_key)
             .header("POLY_BUILDER_TIMESTAMP", &timestamp_str)
             .header("POLY_BUILDER_PASSPHRASE", api_passphrase)
-            .header("POLY_BUILDER_SIGNATURE", &signature)
+            .header("POLY_BUILDER_SIGNATURE", &hmac_signature)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .json(&relayer_request)
             .send()
             .await
-            .context("Failed to send setApprovalForAll request to relayer")?;
-        
+            .context("Failed to send proxy transaction to relayer")?;
+
         let status = response.status();
         let response_text = response.text().await
             .context("Failed to read relayer response")?;
-        
+
         if !status.is_success() {
-            let sig_type_hint = if self.signature_type == Some(2) {
-                "\n\n   💡 For signature_type 2 (GNOSIS_SAFE), the relayer expects a Safe transaction format:\n\
-                  - Get nonce from /nonce endpoint\n\
-                  - Derive Safe address from signer\n\
-                  - Build SafeTx struct hash\n\
-                  - Sign and pack signature\n\
-                  - Send: { from, to, proxyWallet, data, nonce, signature, signatureParams, type: \"SAFE\", metadata }\n\
-                  \n\
-                  Consider using signature_type 1 (POLY_PROXY) if possible, or implement the full Safe flow."
-            } else {
-                ""
-            };
-            
             anyhow::bail!(
-                "Relayer rejected setApprovalForAll request (status: {}): {}\n\
-                \n\
-                CTF Contract Address: {:#x}\n\
-                Exchange Contract Address: {:#x}\n\
-                Signature Type: {:?}\n\
-                \n\
-                This may be a relayer endpoint issue, authentication problem, or request format mismatch.\n\
-                Please verify your Builder API credentials are correct.{}",
-                status, response_text, ctf_contract_address, exchange_address, self.signature_type, sig_type_hint
+                "Relayer rejected proxy transaction (status: {}): {}\n\
+                CTF: {:#x}, Exchange: {:#x}",
+                status, response_text, ctf_contract_address, exchange_address
             );
         }
-        
-        // Parse relayer response
+
         let relayer_response: serde_json::Value = serde_json::from_str(&response_text)
             .context("Failed to parse relayer response")?;
-        
+
         let transaction_id = relayer_response["transactionID"]
             .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing transactionID in relayer response"))?;
-        
-        eprintln!("   ✅ Successfully sent setApprovalForAll transaction via relayer!");
-        eprintln!("   Transaction ID: {}", transaction_id);
-        eprintln!("   💡 The relayer will execute this transaction from your proxy wallet (gasless)");
-        
-        // Wait for transaction confirmation (like TypeScript SDK's response.wait())
-        eprintln!("   ⏳ Waiting for transaction confirmation...");
+            .ok_or_else(|| anyhow::anyhow!("Missing transactionID in relayer response: {}", response_text))?;
+
+        eprintln!("   ✅ Proxy transaction submitted! ID: {}", transaction_id);
+        eprintln!("   ⏳ Waiting for on-chain confirmation...");
         self.wait_for_relayer_transaction(transaction_id).await?;
-        
+
         Ok(())
     }
     
@@ -1276,7 +1347,7 @@ impl PolymarketApi {
     async fn wait_for_relayer_transaction(&self, transaction_id: &str) -> Result<String> {
         // Based on TypeScript SDK pattern: response.wait() returns transactionHash
         // Relayer states: STATE_NEW, STATE_EXECUTED, STATE_MINE, STATE_CONFIRMED, STATE_FAILED, STATE_INVALID
-        let status_url = format!("https://relayer-v2.polymarket.com/transaction/{}", transaction_id);
+        let status_url = format!("https://relayer-v2.polymarket.com/transaction?id={}", transaction_id);
         
         // Poll for transaction confirmation (with timeout)
         let max_wait_seconds = 120;
@@ -1303,22 +1374,34 @@ impl PolymarketApi {
                     if response.status().is_success() {
                         let status_text = response.text().await
                             .context("Failed to read relayer status response")?;
-                        
+
                         let status_data: serde_json::Value = serde_json::from_str(&status_text)
                             .context("Failed to parse relayer status response")?;
-                        
-                        let state = status_data["state"].as_str()
+
+                        // Response is an array of transactions; take the first one
+                        let txn = if let Some(arr) = status_data.as_array() {
+                            if arr.is_empty() {
+                                eprintln!("   ⏳ Transaction not yet visible (elapsed: {}s)", elapsed);
+                                tokio::time::sleep(tokio::time::Duration::from_secs(check_interval_seconds)).await;
+                                continue;
+                            }
+                            &arr[0]
+                        } else {
+                            &status_data
+                        };
+
+                        let state = txn["state"].as_str()
                             .unwrap_or("UNKNOWN");
                         
                         match state {
                             "STATE_CONFIRMED" => {
-                                let tx_hash = status_data["transactionHash"].as_str()
+                                let tx_hash = txn["transactionHash"].as_str()
                                     .unwrap_or("N/A");
                                 eprintln!("   ✅ Transaction confirmed! Hash: {}", tx_hash);
                                 return Ok(tx_hash.to_string());
                             }
                             "STATE_FAILED" | "STATE_INVALID" => {
-                                let error_msg = status_data["metadata"].as_str()
+                                let error_msg = txn["metadata"].as_str()
                                     .unwrap_or("Transaction failed");
                                 anyhow::bail!("Relayer transaction failed: {}", error_msg);
                             }

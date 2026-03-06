@@ -49,10 +49,12 @@ pub struct SimulationTracker {
     total_invested: Arc<Mutex<f64>>,
     // Price trend tracking: Key: (period_timestamp, token_id)
     price_trackers: Arc<Mutex<HashMap<(u64, String), PriceTrendTracker>>>,
+    initial_capital: f64,
+    start_time: chrono::DateTime<chrono::Utc>,
 }
 
 impl SimulationTracker {
-    pub fn new(log_file_path: &str) -> Result<Self> {
+    pub fn new(log_file_path: &str, initial_capital: f64) -> Result<Self> {
         // Create history directory if it doesn't exist
         std::fs::create_dir_all("history").context("Failed to create history directory")?;
         
@@ -70,6 +72,8 @@ impl SimulationTracker {
             total_realized_pnl: Arc::new(Mutex::new(0.0)),
             total_invested: Arc::new(Mutex::new(0.0)),
             price_trackers: Arc::new(Mutex::new(HashMap::new())),
+            initial_capital,
+            start_time: chrono::Utc::now(),
         })
     }
 
@@ -686,19 +690,27 @@ impl SimulationTracker {
             .filter(|p| !p.sold)
             .collect();
         
+        let roi_pct = if self.initial_capital > 0.0 { total_pnl / self.initial_capital * 100.0 } else { 0.0 };
+        let final_balance = self.initial_capital + total_pnl;
         let mut summary = format!(
             "═══════════════════════════════════════════════════════════\n\
              📊 SIMULATION POSITION SUMMARY\n\
              ═══════════════════════════════════════════════════════════\n\
-             Total Invested: ${:.2}\n\
-             Realized PnL: ${:.2}\n\
-             Unrealized PnL: ${:.2}\n\
-             Total PnL: ${:.2}\n\
-             Open Positions: {}\n",
+             Initial Capital: ${:.2}\n\
+             Total Invested:  ${:.2}\n\
+             Realized PnL:    ${:.2}\n\
+             Unrealized PnL:  ${:.2}\n\
+             Total PnL:       ${:.2}\n\
+             Final Balance:   ${:.2}\n\
+             ROI:             {:.2}%\n\
+             Open Positions:  {}\n",
+            self.initial_capital,
             total_invested,
             total_realized,
             unrealized,
             total_pnl,
+            final_balance,
+            roi_pct,
             open_positions.len()
         );
         
@@ -993,6 +1005,175 @@ impl SimulationTracker {
         }
         
         self.log_to_file(&summary).await;
+    }
+
+    /// Query Polymarket API to settle all open positions for closed markets.
+    /// Called at shutdown before writing the final report.
+    pub async fn settle_open_positions(&self, api: &crate::api::PolymarketApi) {
+        // Collect unique condition_ids from unsettled positions
+        let condition_ids: Vec<String> = {
+            let positions = self.positions.lock().await;
+            let mut seen = std::collections::HashSet::new();
+            positions.values()
+                .filter(|p| !p.sold)
+                .filter_map(|p| {
+                    if seen.insert(p.condition_id.clone()) {
+                        Some(p.condition_id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        if condition_ids.is_empty() {
+            return;
+        }
+
+        self.log_to_file(&format!("🔍 Settling {} open market(s) via API...", condition_ids.len())).await;
+
+        for condition_id in &condition_ids {
+            match api.get_market(condition_id).await {
+                Ok(market) if market.closed => {
+                    let winner_token_id = market.tokens.iter()
+                        .find(|t| t.winner)
+                        .map(|t| t.token_id.clone());
+                    self.log_to_file(&format!(
+                        "✅ Market {}... CLOSED — winner: {}",
+                        &condition_id[..16],
+                        winner_token_id.as_deref().map(|id| &id[..id.len().min(16)]).unwrap_or("unknown")
+                    )).await;
+                    self.settle_positions_for_market(condition_id, winner_token_id.as_deref()).await;
+                }
+                Ok(_) => {
+                    self.log_to_file(&format!(
+                        "⏳ Market {}... still open — positions remain open", &condition_id[..16]
+                    )).await;
+                }
+                Err(e) => {
+                    self.log_to_file(&format!(
+                        "⚠️  Could not fetch market {}... for settlement: {}", &condition_id[..16], e
+                    )).await;
+                }
+            }
+        }
+    }
+
+    /// Settle all open positions for a given market using the winning token ID.
+    async fn settle_positions_for_market(&self, condition_id: &str, winner_token_id: Option<&str>) {
+        let to_settle: Vec<(String, SimulatedPosition)> = {
+            let positions = self.positions.lock().await;
+            positions.iter()
+                .filter(|(_, p)| p.condition_id == condition_id && !p.sold)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+
+        for (token_id, position) in to_settle {
+            let won = winner_token_id.map(|wid| wid == token_id.as_str()).unwrap_or(false);
+            let final_price = if won { 1.0_f64 } else { 0.0_f64 };
+            let pnl = position.units * final_price - position.investment_amount;
+
+            {
+                let mut positions = self.positions.lock().await;
+                if let Some(pos) = positions.get_mut(&token_id) {
+                    pos.sold = true;
+                    pos.sell_price_actual = Some(final_price);
+                    pos.sell_timestamp = Some(std::time::Instant::now());
+                }
+            }
+            {
+                let mut total_pnl = self.total_realized_pnl.lock().await;
+                *total_pnl += pnl;
+            }
+
+            let msg = format!(
+                "🏁 SETTLED: {} | {} | bought @${:.4} × {:.2} shares → ${:.2} | PnL: {:+.2}",
+                position.token_type.display_name(),
+                if won { "WON  ($1.00)" } else { "LOST ($0.00)" },
+                position.purchase_price,
+                position.units,
+                position.units * final_price,
+                pnl
+            );
+            self.log_to_file(&msg).await;
+            self.log_to_market(&position.condition_id, position.period_timestamp, &msg).await;
+        }
+    }
+
+    /// Write final simulation report to a JSON file
+    pub async fn write_final_report_json(&self, output_path: &str) -> anyhow::Result<()> {
+        let now = chrono::Utc::now();
+        let session_duration_seconds = (now - self.start_time).num_seconds();
+        let total_invested = *self.total_invested.lock().await;
+        let total_realized_pnl = *self.total_realized_pnl.lock().await;
+        let roi_pct = if self.initial_capital > 0.0 {
+            total_realized_pnl / self.initial_capital * 100.0
+        } else {
+            0.0
+        };
+        let final_balance = self.initial_capital + total_realized_pnl;
+
+        let positions = self.positions.lock().await;
+        let mut positions_json = Vec::new();
+        let mut winning_trades = 0u64;
+        let mut losing_trades = 0u64;
+        let mut open_positions = 0u64;
+
+        for pos in positions.values() {
+            let (pnl, status) = if pos.sold {
+                if let Some(sell_price) = pos.sell_price_actual {
+                    let p = (sell_price - pos.purchase_price) * pos.units;
+                    if p >= 0.0 { winning_trades += 1; } else { losing_trades += 1; }
+                    (p, "closed")
+                } else {
+                    (0.0, "closed")
+                }
+            } else {
+                // Simulation: positions held to market closure are never explicitly "sold"
+                open_positions += 1;
+                (0.0, "open")
+            };
+
+            positions_json.push(serde_json::json!({
+                "token_type": pos.token_type.display_name(),
+                "condition_id": pos.condition_id,
+                "period_timestamp": pos.period_timestamp,
+                "purchase_price": pos.purchase_price,
+                "sell_price": pos.sell_price_actual,
+                "units": pos.units,
+                "investment": pos.investment_amount,
+                "pnl": pnl,
+                "status": status,
+            }));
+        }
+        // total_trades = every position that was actually opened (filled limit orders)
+        let total_trades = winning_trades + losing_trades + open_positions;
+        drop(positions);
+
+        // Count limit orders still waiting to fill (placed but market price never reached target)
+        let pending_limit_orders = self.get_pending_order_count().await;
+
+        let report = serde_json::json!({
+            "generated_at": now.to_rfc3339(),
+            "session_start": self.start_time.to_rfc3339(),
+            "session_duration_seconds": session_duration_seconds,
+            "initial_capital": self.initial_capital,
+            "total_invested": total_invested,
+            "total_realized_pnl": total_realized_pnl,
+            "roi_pct": roi_pct,
+            "final_balance": final_balance,
+            "total_trades": total_trades,
+            "winning_trades": winning_trades,
+            "losing_trades": losing_trades,
+            "open_positions": open_positions,
+            "pending_limit_orders": pending_limit_orders,
+            "positions": positions_json,
+        });
+
+        let json_str = serde_json::to_string_pretty(&report)?;
+        std::fs::write(output_path, &json_str)?;
+        Ok(())
     }
 }
 

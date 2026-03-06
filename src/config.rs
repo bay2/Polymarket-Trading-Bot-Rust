@@ -93,6 +93,9 @@ pub struct TradingConfig {
     pub solana_condition_id: Option<String>,
     pub xrp_condition_id: Option<String>,
     pub check_interval_ms: u64,
+    /// Initial capital for simulation PnL tracking (USD)
+    /// Default: 1000.0 ($1000.00)
+    pub initial_capital: f64,
     /// Fixed trade amount in USD for BTC Up token purchase
     /// Default: 1.0 ($1.00)
     pub fixed_trade_amount: f64,
@@ -174,6 +177,9 @@ pub struct TradingConfig {
     pub trailing_shares: Option<f64>,
     /// 5m dual-limit: when true, use trailing-buy mode (no limit orders; monitor token with ask > 0.55, track highest, buy when ask <= highest - trailing_stop; then second trailing for opposite with band from first bought price). When false, use limit-order mode (place Up/Down at dual_limit_price).
     pub dual_limit_trailing_buy_mode: Option<bool>,
+    /// Duration of one market period in seconds. Used to determine when a market has closed for
+    /// simulation settlement. Default: 900 (15-minute markets). Set to 300 for 5-minute BTC markets.
+    pub market_duration_seconds: u64,
 }
 
 impl Default for PolymarketConfig {
@@ -199,6 +205,7 @@ impl Default for TradingConfig {
             solana_condition_id: None,
             xrp_condition_id: None,
             check_interval_ms: 1000,
+            initial_capital: 1000.0,
             fixed_trade_amount: 1.0,
             trigger_price: 0.9,
             min_elapsed_minutes: 10,
@@ -225,6 +232,7 @@ impl Default for TradingConfig {
             dual_limit_hedge_trailing_stop: Some(0.03),
             trailing_shares: Some(10.0),
             dual_limit_trailing_buy_mode: Some(false),
+            market_duration_seconds: 900,
         }
     }
 }

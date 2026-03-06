@@ -35,7 +35,7 @@ impl Trader {
 
     pub fn new(api: Arc<PolymarketApi>, config: TradingConfig, simulation_mode: bool, detector: Option<Arc<PriceDetector>>) -> Result<Self> {
         let simulation_tracker = if simulation_mode {
-            Some(Arc::new(SimulationTracker::new("simulation.toml")?))
+            Some(Arc::new(SimulationTracker::new("simulation.toml", config.initial_capital)?))
         } else {
             None
         };
@@ -1487,44 +1487,35 @@ impl Trader {
                     token_ids_to_fetch.len()
                 )).await;
                 
-                // Fetch prices for all tokens
+                // Simulation only: this entire block is inside `if let Some(tracker)` which is
+                // only Some in simulation mode. Real-mode limit orders are matched by the exchange.
+                //
+                // Use /price endpoint (not /book orderbook) for simulation fill checks:
+                //   - /book returns extreme prices ($0.01 bid / $0.99 ask) for newly-opened
+                //     5-minute markets because the CLOB orderbook is nearly empty.
+                //   - /price returns the real mid-market price used by the price monitor.
+                // Convention:
+                //   BUY order fills when ask <= target  → ask = get_price("BUY") = cost to buy
+                //   SELL order fills when bid >= target → bid = get_price("SELL") = proceeds
                 for token_id in token_ids_to_fetch {
                     if !current_prices.contains_key(&token_id) {
-                        // Fetch current price for this token using orderbook
-                        match self.api.get_orderbook(&token_id).await {
-                            Ok(orderbook) => {
-                                let bid = orderbook.bids.first().map(|e| e.price);
-                                let ask = orderbook.asks.first().map(|e| e.price);
-                                let token_price = TokenPrice {
-                                    token_id: token_id.clone(),
-                                    bid,
-                                    ask,
-                                };
-                                current_prices.insert(token_id.clone(), token_price);
-                                
-                                // Log if ask is missing (for BUY orders) or bid is missing (for SELL orders)
-                                if ask.is_none() {
-                                    if let Some(tracker) = &self.simulation_tracker {
-                                        let pending_order_token_ids = tracker.get_pending_order_token_ids().await;
-                                        if pending_order_token_ids.contains(&token_id) {
-                                            tracker.log_to_file(&format!(
-                                                "⚠️  SIMULATION: No ask price available for token {} (BUY orders may not fill)",
-                                                &token_id[..16]
-                                            )).await;
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                // Log API errors in simulation mode
-                                if let Some(tracker) = &self.simulation_tracker {
-                                    tracker.log_to_file(&format!(
-                                        "⚠️  SIMULATION: Failed to fetch orderbook for token {}: {}",
-                                        &token_id[..16],
-                                        e
-                                    )).await;
-                                }
-                            }
+                        let buy_price = self.api.get_price(&token_id, "BUY").await.ok();
+                        let sell_price = self.api.get_price(&token_id, "SELL").await.ok();
+
+                        if buy_price.is_none() && sell_price.is_none() {
+                            tracker.log_to_file(&format!(
+                                "⚠️  SIMULATION: Failed to fetch price for token {}",
+                                &token_id[..16]
+                            )).await;
+                        } else {
+                            let token_price = TokenPrice {
+                                token_id: token_id.clone(),
+                                // ask = BUY price (what you pay to buy) — used in BUY fill check
+                                ask: buy_price,
+                                // bid = SELL price (what you receive) — used in SELL fill check
+                                bid: sell_price,
+                            };
+                            current_prices.insert(token_id.clone(), token_price);
                         }
                     }
                 }
@@ -3342,10 +3333,9 @@ impl Trader {
                 
                 // Check each position for market closure
                 for position in positions {
-                    // Market closes at period_timestamp + 900 seconds
-                    let market_end_timestamp = position.period_timestamp + 900;
+                    let market_end_timestamp = position.period_timestamp + self.config.market_duration_seconds;
                     let seconds_until_close = market_end_timestamp.saturating_sub(current_timestamp);
-                    
+
                     if current_timestamp < market_end_timestamp - 30 {
                         // Market hasn't closed yet
                         continue;
@@ -3467,8 +3457,7 @@ impl Trader {
                 continue;
             }
             
-            // Market closes at market_timestamp + 900 seconds
-            let market_end_timestamp = trade.market_timestamp + 900;
+            let market_end_timestamp = trade.market_timestamp + self.config.market_duration_seconds;
             let seconds_until_close = market_end_timestamp.saturating_sub(current_timestamp);
             
             if current_timestamp < market_end_timestamp - 30 {

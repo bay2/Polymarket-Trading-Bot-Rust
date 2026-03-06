@@ -554,7 +554,8 @@ async fn main() -> Result<()> {
     let trader_for_discovery = trader_clone.clone();
     let simulation_tracker_for_discovery = if is_simulation { trader_clone.get_simulation_tracker() } else { None };
 
-    monitor_arc.start_monitoring(move |snapshot| {
+    let trader_for_shutdown = trader_arc.clone();
+    let monitoring_fut = monitor_arc.start_monitoring(move |snapshot| {
         let trader = trader_clone.clone();
         let api = api_for_callback.clone();
         let monitor_for_discovery = monitor_for_callback.clone();
@@ -2719,7 +2720,23 @@ async fn main() -> Result<()> {
             }
 
         }
-    }).await;
+    });
+
+    tokio::select! {
+        _ = monitoring_fut => {}
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("
+⚠️  Shutting down (Ctrl+C)...");
+            if is_simulation {
+                if let Some(tracker) = trader_for_shutdown.get_simulation_tracker() {
+                    match tracker.write_final_report_json("simulation_report.json").await {
+                        Ok(()) => eprintln!("✅ Final simulation report saved to simulation_report.json"),
+                        Err(e) => eprintln!("❌ Failed to write simulation report: {}", e),
+                    }
+                }
+            }
+        }
+    }
 
     Ok(())
 }
